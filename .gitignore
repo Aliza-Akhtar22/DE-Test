@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+dltvenv/
+venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# dlt artifacts
+.dlt/
+*.duckdb
+
+# OS / editor
+.DS_Store
+.vscode/
