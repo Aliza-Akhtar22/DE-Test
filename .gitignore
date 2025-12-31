@@ -19,3 +19,8 @@ venv/
 # OS / editor
 .DS_Store
 .vscode/
+
+# DuckDB database files
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
