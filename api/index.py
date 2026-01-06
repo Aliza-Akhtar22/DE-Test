@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 
 app = FastAPI(title="CSV to Postgres via dlt")
 
-@dlt.resource(name="student", write_disposition="append")
+@dlt.resource(name="new_csv", write_disposition="append")
 def student_rows(rows: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
     # rows is already a generator of dicts
     yield from rows
