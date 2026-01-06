@@ -10,35 +10,27 @@ app = FastAPI(title="CSV to Postgres via dlt")
 
 
 def safe_table_name(filename: str) -> str:
-    """
-    Convert filename like 'Mall_Customers.csv' -> 'mall_customers'
-    Keeps only a-z, 0-9, underscore. Ensures it starts with a letter/_.
-    """
     base = (filename or "").rsplit(".", 1)[0].lower().strip()
     base = re.sub(r"[^a-z0-9_]+", "_", base).strip("_")
     if not base:
         base = "uploaded_csv"
-    # Postgres identifier rule-of-thumb: don't start with a digit
     if base[0].isdigit():
         base = f"t_{base}"
     return base
 
 
 def parse_csv_upload(file_bytes: bytes) -> Iterator[Dict[str, Any]]:
-    # Parse CSV in-memory (no filesystem dependency)
+    # utf-8 + BOM safe
     try:
-        text_stream = io.StringIO(file_bytes.decode("utf-8"))
+        text = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
-        # Some CSVs come in different encodings; you can add more fallbacks if needed
-        text_stream = io.StringIO(file_bytes.decode("utf-8-sig", errors="replace"))
+        text = file_bytes.decode("utf-8", errors="replace")
 
-    reader = csv.DictReader(text_stream)
+    reader = csv.DictReader(io.StringIO(text))
     if reader.fieldnames is None:
-        # No header row detected
-        raise ValueError("CSV file must have a header row (column names)")
+        raise ValueError("CSV must have a header row (column names).")
 
     for row in reader:
-        # Optional: strip whitespace in string fields
         yield {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
 
 
@@ -56,7 +48,6 @@ async def load_csv(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Create pipeline (same as your script)
     pipeline = dlt.pipeline(
         pipeline_name="csv_to_postgres_pipeline",
         destination="postgres",
@@ -68,7 +59,6 @@ async def load_csv(file: UploadFile = File(...)):
     try:
         rows_iter = parse_csv_upload(content)
 
-        # ✅ Key change: write directly from the iterator and set table_name dynamically
         load_info = pipeline.run(
             rows_iter,
             table_name=table_name,
@@ -77,7 +67,6 @@ async def load_csv(file: UploadFile = File(...)):
 
         return {
             "message": "Loaded successfully",
-            "filename": file.filename,
             "schema": "csv_demo",
             "table": table_name,
             "full_table": f"csv_demo.{table_name}",
