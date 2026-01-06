@@ -1,17 +1,30 @@
 import csv
 import io
 import re
-from typing import Iterator, Dict, Any
+from typing import Iterator, Dict, Any, Optional
 
 import dlt
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 
 app = FastAPI(title="CSV to Postgres via dlt")
 
 
-def safe_table_name(filename: str) -> str:
-    base = (filename or "").rsplit(".", 1)[0].lower().strip()
-    base = re.sub(r"[^a-z0-9_]+", "_", base).strip("_")
+# ---------- Helpers ----------
+
+def slugify_table_name(filename: str) -> str:
+    """
+    Convert filename -> safe table name:
+    'Mall_Customers.csv' -> 'mall_customers'
+    'AirPassengers.csv'  -> 'airpassengers'
+    """
+    base = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]  # just in case
+    base = re.sub(r"\.csv$", "", base, flags=re.IGNORECASE)
+    base = base.strip().lower()
+
+    # replace anything not alnum with underscore
+    base = re.sub(r"[^a-z0-9]+", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+
     if not base:
         base = "uploaded_csv"
     if base[0].isdigit():
@@ -19,20 +32,78 @@ def safe_table_name(filename: str) -> str:
     return base
 
 
-def parse_csv_upload(file_bytes: bytes) -> Iterator[Dict[str, Any]]:
-    # utf-8 + BOM safe
-    try:
-        text = file_bytes.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = file_bytes.decode("utf-8", errors="replace")
+def normalize_header(h: str) -> str:
+    """
+    Normalize CSV headers:
+    'Month' -> 'month'
+    '#Passengers' -> 'passengers'
+    'Annual Income (k$)' -> 'annual_income_k'
+    """
+    if h is None:
+        return "col"
 
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
-        raise ValueError("CSV must have a header row (column names).")
+    h = h.strip().lower()
+
+    # remove leading # (common in AirPassengers)
+    h = h.lstrip("#")
+
+    # replace non-alnum with underscore
+    h = re.sub(r"[^a-z0-9]+", "_", h)
+    h = re.sub(r"_+", "_", h).strip("_")
+
+    if not h:
+        h = "col"
+    if h[0].isdigit():
+        h = f"c_{h}"
+    return h
+
+
+def decode_csv_bytes(file_bytes: bytes) -> str:
+    # Handle utf-8 with BOM + fallback
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return file_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # last resort
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def parse_csv_upload(file_bytes: bytes) -> Iterator[Dict[str, Any]]:
+    text = decode_csv_bytes(file_bytes)
+    text_stream = io.StringIO(text)
+
+    reader = csv.DictReader(text_stream)
+    if not reader.fieldnames:
+        return iter(())
+
+    # normalize headers once
+    normalized_fields = [normalize_header(f) for f in reader.fieldnames]
 
     for row in reader:
-        yield {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+        out: Dict[str, Any] = {}
+        for raw_key, norm_key in zip(reader.fieldnames, normalized_fields):
+            val = row.get(raw_key)
+            if isinstance(val, str):
+                val = val.strip()
+                if val == "":
+                    val = None
+            out[norm_key] = val
+        yield out
 
+
+def make_resource(table_name: str, write_disposition: str):
+    """
+    Create a dlt resource dynamically so table name changes per upload.
+    """
+    @dlt.resource(name=table_name, write_disposition=write_disposition)
+    def csv_rows(rows: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+        yield from rows
+
+    return csv_rows
+
+
+# ---------- API ----------
 
 @app.get("/health")
 def health():
@@ -40,7 +111,11 @@ def health():
 
 
 @app.post("/load-csv")
-async def load_csv(file: UploadFile = File(...)):
+async def load_csv(
+    file: UploadFile = File(...),
+    mode: str = Query(default="replace", pattern="^(replace|append)$"),
+    table: Optional[str] = Query(default=None, description="Optional override table name"),
+):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
@@ -48,31 +123,26 @@ async def load_csv(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    table_name = normalize_header(table) if table else slugify_table_name(file.filename)
+
     pipeline = dlt.pipeline(
         pipeline_name="csv_to_postgres_pipeline",
         destination="postgres",
         dataset_name="csv_demo",
     )
 
-    table_name = safe_table_name(file.filename)
+    write_disposition = "replace" if mode == "replace" else "append"
 
     try:
         rows_iter = parse_csv_upload(content)
-
-        load_info = pipeline.run(
-            rows_iter,
-            table_name=table_name,
-            write_disposition="append",
-        )
+        resource = make_resource(table_name, write_disposition)
+        load_info = pipeline.run(resource(rows_iter))
 
         return {
             "message": "Loaded successfully",
-            "schema": "csv_demo",
-            "table": table_name,
-            "full_table": f"csv_demo.{table_name}",
+            "table": f"csv_demo.{table_name}",
+            "mode": mode,
             "load_info": str(load_info),
         }
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Load failed: {e}")
