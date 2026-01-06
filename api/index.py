@@ -1,5 +1,6 @@
 import csv
 import io
+import re
 from typing import Iterator, Dict, Any
 
 import dlt
@@ -7,26 +8,48 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 
 app = FastAPI(title="CSV to Postgres via dlt")
 
-@dlt.resource(name="new_csv", write_disposition="append")
-def student_rows(rows: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
-    # rows is already a generator of dicts
-    yield from rows
+
+def safe_table_name(filename: str) -> str:
+    """
+    Convert filename like 'Mall_Customers.csv' -> 'mall_customers'
+    Keeps only a-z, 0-9, underscore. Ensures it starts with a letter/_.
+    """
+    base = (filename or "").rsplit(".", 1)[0].lower().strip()
+    base = re.sub(r"[^a-z0-9_]+", "_", base).strip("_")
+    if not base:
+        base = "uploaded_csv"
+    # Postgres identifier rule-of-thumb: don't start with a digit
+    if base[0].isdigit():
+        base = f"t_{base}"
+    return base
+
 
 def parse_csv_upload(file_bytes: bytes) -> Iterator[Dict[str, Any]]:
     # Parse CSV in-memory (no filesystem dependency)
-    text_stream = io.StringIO(file_bytes.decode("utf-8"))
+    try:
+        text_stream = io.StringIO(file_bytes.decode("utf-8"))
+    except UnicodeDecodeError:
+        # Some CSVs come in different encodings; you can add more fallbacks if needed
+        text_stream = io.StringIO(file_bytes.decode("utf-8-sig", errors="replace"))
+
     reader = csv.DictReader(text_stream)
+    if reader.fieldnames is None:
+        # No header row detected
+        raise ValueError("CSV file must have a header row (column names)")
+
     for row in reader:
-        # Optional: strip whitespace
+        # Optional: strip whitespace in string fields
         yield {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.post("/load-csv")
 async def load_csv(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".csv"):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
     content = await file.read()
@@ -40,10 +63,27 @@ async def load_csv(file: UploadFile = File(...)):
         dataset_name="csv_demo",
     )
 
+    table_name = safe_table_name(file.filename)
+
     try:
         rows_iter = parse_csv_upload(content)
-        load_info = pipeline.run(student_rows(rows_iter))
-        # load_info is a dlt LoadInfo object; str(load_info) is usually enough for API output
-        return {"message": "Loaded successfully", "load_info": str(load_info)}
+
+        # ✅ Key change: write directly from the iterator and set table_name dynamically
+        load_info = pipeline.run(
+            rows_iter,
+            table_name=table_name,
+            write_disposition="append",
+        )
+
+        return {
+            "message": "Loaded successfully",
+            "filename": file.filename,
+            "schema": "csv_demo",
+            "table": table_name,
+            "full_table": f"csv_demo.{table_name}",
+            "load_info": str(load_info),
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Load failed: {e}")
