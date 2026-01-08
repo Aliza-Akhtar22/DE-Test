@@ -109,6 +109,10 @@ def table_exists_and_columns(engine, schema_name: str, table_name: str) -> Tuple
     col_names = [c["name"] for c in cols]
     return True, col_names
 
+def ensure_schema_exists(engine, schema_name: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'))
+
 
 def columns_match(existing_cols: List[str], incoming_cols: List[str]) -> bool:
     # Match by exact set (case already normalized). Order not important.
@@ -153,7 +157,7 @@ def choose_table_name_atomic(
 # ----------------------------
 
 def make_resource(table_name: str, write_disposition: str):
-    @dlt.resource(name=table_name, write_disposition=write_disposition)
+    @dlt.resource(name=table_name, write_disposition=write_disposition, columns="freeze")
     def csv_rows(rows: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
         yield from rows
     return csv_rows
@@ -204,12 +208,13 @@ async def load_csv(
     # Decide table name based on schema matching rules (and do it safely under concurrency)
     try:
         engine = get_sqlalchemy_engine()
+        ensure_schema_exists(engine, schema_name)
         final_table_name, decision = choose_table_name_atomic(engine, schema_name, base_table_name, incoming_cols)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB inspection failed: {e}")
 
     pipeline = dlt.pipeline(
-        pipeline_name="csv_to_postgres_pipeline",
+        pipeline_name=f"csv_to_postgres_{final_table_name}",
         destination="postgres",
         dataset_name=schema_name,   # maps to Postgres schema in dlt
     )
