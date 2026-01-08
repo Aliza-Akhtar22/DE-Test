@@ -185,9 +185,6 @@ async def load_csv(
     # append: append into target table
     mode: str = Query(default="replace", pattern="^(replace|append)$"),
 
-    # override base table name
-    table: Optional[str] = Query(default=None, description="Optional base table name override"),
-
     # "new DB" equivalent: put data into a separate schema (dataset) inside the same Postgres database
     db: str = Query(default="csv_demo", description="Schema/dataset name (acts like logical DB)"),
 ):
@@ -202,7 +199,7 @@ async def load_csv(
     if not incoming_cols:
         raise HTTPException(status_code=400, detail="CSV has no header row")
 
-    base_table_name = normalize_header(table) if table else slugify_table_name(file.filename)
+    base_table_name = slugify_table_name(file.filename)
     schema_name = normalize_header(db)  # keep schema name safe too
 
     # Decide table name based on schema matching rules (and do it safely under concurrency)
